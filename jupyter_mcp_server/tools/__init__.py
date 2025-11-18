@@ -11,7 +11,7 @@ that can operate in either MCP_SERVER or JUPYTER_SERVER mode.
 from jupyter_mcp_server.tools._base import BaseTool, ServerMode
 
 # Import tool implementations - Notebook Management
-from jupyter_mcp_server.tools.list_notebooks_tool import ListNotebooksTool
+from jupyter_mcp_server.tools.list_sessions_tool import ListSessionsTool
 from jupyter_mcp_server.tools.restart_notebook_tool import RestartNotebookTool
 from jupyter_mcp_server.tools.unuse_notebook_tool import UnuseNotebookTool
 from jupyter_mcp_server.tools.use_notebook_tool import UseNotebookTool
@@ -40,7 +40,7 @@ __all__ = [
     "BaseTool",
     "ServerMode",
     # Notebook Management
-    "ListNotebooksTool",
+    "ListSessionsTool",
     "RestartNotebookTool",
     "UnuseNotebookTool",
     "UseNotebookTool",

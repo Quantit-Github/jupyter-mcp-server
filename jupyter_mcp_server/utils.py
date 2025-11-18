@@ -5,43 +5,316 @@
 import re
 import asyncio
 import time
-from typing import Any, Union
+from typing import Any, Union, Optional, Tuple
 from mcp.types import ImageContent
 from jupyter_mcp_server.config import ALLOW_IMG_OUTPUT
 from jupyter_nbmodel_client import NotebookModel
+from jupyter_mcp_server.log import logger
+
+
+def get_notebook_context_from_session(
+    session_id: Optional[str] = None,
+    notebook_manager=None  # deprecated, 호환성 유지
+) -> Tuple[str, str]:
+    """Retrieve notebook context from SessionStore with config fallback (ARK-165).
+
+    This is the primary function for retrieving notebook context in a session-aware manner.
+    It enables multi-client support by looking up the notebook path and kernel ID associated
+    with a specific session_id, while maintaining backward compatibility with single-client mode.
+
+    Lookup Priority:
+        1. SessionStore (if session_id provided and context exists)
+           - Returns session-specific notebook_path and kernel_id
+           - Enables multi-client isolation
+
+        2. Config fallback (if session_id not provided or context not found)
+           - Returns config.document_id and config.runtime_id
+           - Single-client mode for backward compatibility
+           - Logs warning about multi-client usage
+
+    Args:
+        session_id: Client session ID for multi-client support (ARK-165)
+            - Optional, but required for multi-client environments
+            - UUID format recommended (e.g., str(uuid.uuid4()))
+            - Must match the session_id used in use_notebook tool
+            - If omitted, falls back to config values (single-client mode)
+        notebook_manager: NotebookManager instance (DEPRECATED)
+            - Kept for backward compatibility only
+            - No longer used in implementation
+            - Will be removed in future versions
+
+    Returns:
+        Tuple[str, str]: (notebook_path, kernel_id)
+            - notebook_path: Relative path from Jupyter root (e.g., "work/notebook.ipynb")
+            - kernel_id: Jupyter kernel ID string (e.g., "abc-123-def-456")
+            - Both values guaranteed to be non-None strings
+
+    Raises:
+        No exceptions raised - always returns valid tuple
+        (Falls back to config if session lookup fails)
+
+    Example:
+        Multi-client mode (recommended for ARK-165):
+        ```python
+        import uuid
+        from jupyter_mcp_server.utils import get_notebook_context_from_session
+
+        # Client A
+        session_a = str(uuid.uuid4())
+        path_a, kernel_a = get_notebook_context_from_session(session_id=session_a)
+        # Returns: ("notebooks/a.ipynb", "kernel-a-id")
+
+        # Client B (independent context)
+        session_b = str(uuid.uuid4())
+        path_b, kernel_b = get_notebook_context_from_session(session_id=session_b)
+        # Returns: ("notebooks/b.ipynb", "kernel-b-id")
+
+        assert path_a != path_b  # Different notebooks
+        assert kernel_a != kernel_b  # Different kernels
+        ```
+
+        Single-client mode (backward compatible):
+        ```python
+        # No session_id - falls back to config
+        path, kernel = get_notebook_context_from_session()
+        # Returns: (config.document_id, config.runtime_id)
+        # Logs warning about multi-client usage
+        ```
+
+    Notes:
+        - ARK-165: Core function enabling session-based multi-client support
+        - Thread-safe: SessionStore operations are thread-safe
+        - Always returns valid tuple (never returns None)
+        - Fallback to config ensures backward compatibility
+        - Used by all cell operation tools for context lookup
+        - Replaces deprecated get_current_notebook_context()
+
+    See Also:
+        - SessionStore.get(): Retrieves session context
+        - UseNotebookTool.execute(): Creates and updates sessions
+        - get_config(): Provides fallback values
+    """
+    from .server import session_store
+    from .config import get_config
+
+    # ARK-165: Priority 1 - Lookup from SessionStore (multi-client mode)
+    # If session_id provided, try to retrieve session-specific context
+    # This enables multiple clients to work with different notebooks simultaneously
+    if session_id:
+        ctx = session_store.get(session_id)
+        # Verify context has required fields before returning
+        # Both notebook_path and kernel_id must be set for valid session
+        if ctx and ctx.notebook_path and ctx.kernel_id:
+            # SUCCESS: Return session-specific context
+            # This notebook/kernel pair is isolated to this client session
+            return ctx.notebook_path, ctx.kernel_id
+        # FALLTHROUGH: Session exists but incomplete → fall back to config
+
+    # ARK-165: Priority 2 - Fallback to config (single-client mode, backward compatible)
+    # This ensures backward compatibility when session_id not provided
+    # or when session lookup fails (e.g., expired session)
+    if not session_id:
+        # Warn developer about single-client fallback
+        # In multi-client scenarios, session_id should always be provided
+        logger.warning(
+            "No session_id specified, using default from config. "
+            "For multi-client scenarios, please create a session_id and use it consistently."
+        )
+
+    # Return default notebook/kernel from config
+    # config.document_id: Default notebook path (e.g., from CLI --document-url)
+    # config.runtime_id: Default kernel ID (e.g., from CLI --runtime-url)
+    config = get_config()
+    return config.document_id, config.runtime_id
+
+
+async def get_notebook_context_from_session_async(
+    session_id: Optional[str] = None,
+    auto_heal: bool = True,
+    kernel_manager=None,
+    server_client=None,
+    mode=None
+) -> Tuple[str, str]:
+    """Retrieve notebook context with automatic kernel healing (ARK-165 커널 힐링 리팩토링).
+
+    이것이 권장되는 함수입니다. 모든 새로운 코드는 이 async 버전을 사용하세요.
+    SessionManager를 사용하여 커널 헬스 체크 및 자동 힐링을 지원합니다.
+
+    Lookup Priority:
+        1. SessionStore (if session_id provided and context exists)
+           - 커널 헬스 체크 수행 (auto_heal=True일 때)
+           - 커널이 죽었으면 자동으로 새 커널 생성
+           - Returns session-specific notebook_path and kernel_id
+
+        2. Config fallback (if session_id not provided or context not found)
+           - Returns config.document_id and config.runtime_id
+           - Single-client mode for backward compatibility
+
+    Args:
+        session_id: Client session ID for multi-client support
+            - Optional, but required for multi-client environments
+            - UUID format recommended
+        auto_heal: Enable automatic kernel healing (default: True)
+            - True: 커널이 죽었을 때 자동으로 새 커널 생성
+            - False: 기존 sync 함수와 동일한 동작 (커널 체크 없음)
+        kernel_manager: For JUPYTER_SERVER mode kernel operations
+            - Required if auto_heal=True and mode=JUPYTER_SERVER
+        server_client: For MCP_SERVER mode kernel operations
+            - Required if auto_heal=True and mode=MCP_SERVER
+        mode: Server mode (JUPYTER_SERVER or MCP_SERVER)
+            - Required if auto_heal=True
+
+    Returns:
+        Tuple[str, str]: (notebook_path, kernel_id)
+            - notebook_path: Relative path from Jupyter root
+            - kernel_id: Jupyter kernel ID string
+            - Both values guaranteed to be non-None strings
+
+    Raises:
+        No exceptions raised - always returns valid tuple
+        (Falls back to config if session lookup or healing fails)
+
+    Example:
+        Auto-healing mode (JUPYTER_SERVER):
+        ```python
+        from jupyter_mcp_server.utils import get_notebook_context_from_session_async
+        from jupyter_mcp_server.tools._base import ServerMode
+
+        # 커널 헬스 체크 + 자동 힐링
+        path, kernel = await get_notebook_context_from_session_async(
+            session_id="session-A",
+            auto_heal=True,
+            kernel_manager=kernel_manager,
+            mode=ServerMode.JUPYTER_SERVER
+        )
+        # 커널이 죽어있으면 자동으로 새 커널 생성
+        ```
+
+        Auto-healing mode (MCP_SERVER):
+        ```python
+        # MCP_SERVER 모드
+        path, kernel = await get_notebook_context_from_session_async(
+            session_id="session-B",
+            auto_heal=True,
+            server_client=server_client,
+            mode=ServerMode.MCP_SERVER
+        )
+        ```
+
+        No auto-healing (기존 동작):
+        ```python
+        # auto_heal=False - 커널 체크 없음
+        path, kernel = await get_notebook_context_from_session_async(
+            session_id="session-C",
+            auto_heal=False
+        )
+        ```
+
+    Notes:
+        - ARK-165 커널 힐링 리팩토링: 커널 자동 복구 지원
+        - SessionManager를 통해 중앙화된 커널 힐링 로직 사용
+        - 모든 새로운 async tool은 이 함수를 사용해야 함
+        - 기존 sync 함수는 backward compatibility를 위해 유지
+
+    See Also:
+        - SessionManager.get_session_with_kernel_check(): 커널 헬스 체크
+        - SessionManager.heal_kernel(): 커널 자동 복구
+        - get_notebook_context_from_session(): Sync 버전 (deprecated)
+    """
+    from .server import session_store
+    from .session_manager import SessionManager
+    from .config import get_config
+
+    # ARK-165: Validation - auto_heal requires session_id
+    if auto_heal and not session_id:
+        logger.warning(
+            "auto_heal=True requires session_id for kernel healing. "
+            "Disabling auto_heal and using config fallback."
+        )
+        auto_heal = False
+
+    # SessionManager 초기화
+    session_manager = SessionManager(session_store)
+
+    # ARK-165: Priority 1 - Lookup from SessionStore with auto-healing
+    if session_id and auto_heal:
+        # 커널 헬스 체크 + 자동 힐링
+        ctx, kernel_healthy = await session_manager.get_session_with_kernel_check(
+            session_id, kernel_manager, server_client, mode
+        )
+
+        if ctx and not kernel_healthy:
+            # 커널이 죽었음 - 자동 힐링 시도
+            logger.warning(
+                f"Kernel unhealthy for session {session_id[:8]}..., attempting heal"
+            )
+            new_kernel_id = await session_manager.heal_kernel(
+                session_id=session_id,
+                kernel_manager=kernel_manager,
+                server_client=server_client,
+                mode=mode,
+                notebook_path=ctx.notebook_path
+            )
+
+            if new_kernel_id:
+                # 힐링 성공 - SessionStore에서 업데이트된 context 가져오기
+                ctx = session_store.get(session_id)
+                logger.info(f"✓ Kernel healed successfully: {new_kernel_id}")
+            else:
+                # 힐링 실패 - 세션의 notebook_path는 유지하되, config kernel만 fallback
+                logger.error(
+                    f"✗ Kernel healing failed for session {session_id}, keeping session notebook_path"
+                )
+                config = get_config()
+                # 세션의 notebook_path 유지 (중요!), config의 kernel_id만 fallback
+                if ctx and ctx.notebook_path:
+                    return ctx.notebook_path, config.runtime_id
+                else:
+                    return config.document_id, config.runtime_id
+
+        # 커널이 healthy하거나 힐링 성공 - 세션 context 반환
+        # notebook_path만 있어도 반환 (kernel_id는 나중에 생성될 수 있음)
+        if ctx and ctx.notebook_path:
+            return ctx.notebook_path, ctx.kernel_id if ctx.kernel_id else None
+
+    elif session_id:
+        # auto_heal=False - 기존 동작 (커널 체크 없음)
+        ctx = session_store.get(session_id)
+        if ctx and ctx.notebook_path and ctx.kernel_id:
+            return ctx.notebook_path, ctx.kernel_id
+
+    # ARK-165: Priority 2 - Fallback to config (backward compatible)
+    if not session_id:
+        logger.warning(
+            "No session_id specified, using default from config. "
+            "For multi-client scenarios, please create a session_id and use it consistently."
+        )
+
+    config = get_config()
+    return config.document_id, config.runtime_id
 
 
 def get_current_notebook_context(notebook_manager=None):
     """
+    DEPRECATED: Use get_notebook_context_from_session() instead.
+
     Get the current notebook path and kernel ID for JUPYTER_SERVER mode.
-    
+
+    This function is deprecated as of ARK-165. For multi-client support,
+    use get_notebook_context_from_session(session_id=...) instead.
+
     Args:
-        notebook_manager: NotebookManager instance (optional)
-        
+        notebook_manager: NotebookManager instance (optional, ignored)
+
     Returns:
         Tuple of (notebook_path, kernel_id)
-        Falls back to config values if notebook_manager not provided
+        Falls back to config values
     """
-    from .config import get_config
-    
-    notebook_path = None
-    kernel_id = None
-    
-    if notebook_manager:
-        # Try to get current notebook info from manager
-        notebook_path = notebook_manager.get_current_notebook_path()
-        current_notebook = notebook_manager.get_current_notebook() or "default"
-        kernel_id = notebook_manager.get_kernel_id(current_notebook)
-    
-    # Fallback to config if not found in manager
-    if not notebook_path or not kernel_id:
-        config = get_config()
-        if not notebook_path:
-            notebook_path = config.document_id
-        if not kernel_id:
-            kernel_id = config.runtime_id
-    
-    return notebook_path, kernel_id
+    logger.warning(
+        "[DEPRECATED] get_current_notebook_context() is deprecated. "
+        "Use get_notebook_context_from_session(session_id=...) for multi-client support."
+    )
+    return get_notebook_context_from_session(session_id=None, notebook_manager=notebook_manager)
 
 
 def extract_output(output: Union[dict, Any]) -> Union[str, ImageContent]:

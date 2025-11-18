@@ -125,3 +125,6 @@ docs/.yarn/*
 
 uv.lock
 *-lock.json
+
+*PLAN*.md
+*REPORT*.md

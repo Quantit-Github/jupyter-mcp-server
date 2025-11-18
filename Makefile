@@ -115,7 +115,7 @@ start-jupyter-server-extension: ## start jupyter server with MCP extension
 	@exec echo
 	@exec echo "Test with: curl http://localhost:4040/mcp/healthz"
 	@exec echo
-	jupyter lab \
+	uv run jupyter lab \
 	  --JupyterMCPServerExtensionApp.document_url local \
 	  --JupyterMCPServerExtensionApp.runtime_url local \
 	  --JupyterMCPServerExtensionApp.document_id notebook.ipynb \
