@@ -468,9 +468,15 @@ class UseNotebookTool(BaseTool):
                         f"Created new kernel '{kernel_id}'."
                     )
             else:
-                # kernel_id가 없으면 새 커널 생성 (first connection)
+                # kernel_id가 없으면 새 커널 생성 (first connection 또는 healing 실패 후)
                 kernel = await self._start_kernel_local(kernel_manager)
                 kernel_id = kernel['id']
+                # ctx가 있으면 healing 실패 후 새 커널 생성
+                if ctx:
+                    info_list.append(
+                        f"[INFO] Previous kernel was not found (may have been terminated). "
+                        f"Created new kernel '{kernel_id}'."
+                    )
 
             if not any("[INFO] Previous kernel" in msg for msg in info_list):
                 info_list.append(f"[INFO] Connected to kernel '{kernel_id}'.")
