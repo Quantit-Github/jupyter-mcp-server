@@ -324,8 +324,9 @@ class UseNotebookTool(BaseTool):
 
         # ARK-165: SessionManager를 사용한 커널 헬스 체크 (리팩토링)
         # SessionManager가 커널 존재 여부를 확인하여 early exit 판단
-        session_manager = SessionManager(session_store)
-        ctx, kernel_healthy = await session_manager.get_session_with_kernel_check(
+        # Note: Use different variable name to avoid shadowing Jupyter's session_manager parameter
+        mcp_session_manager = SessionManager(session_store)
+        ctx, kernel_healthy = await mcp_session_manager.get_session_with_kernel_check(
             session_id=session_id,
             kernel_manager=kernel_manager,
             server_client=server_client,
@@ -417,7 +418,7 @@ class UseNotebookTool(BaseTool):
                 f"Kernel '{kernel_id}' not found in session '{session_id[:8]}...'. "
                 f"Attempting auto-recovery with SessionManager."
             )
-            new_kernel_id = await session_manager.heal_kernel(
+            new_kernel_id = await mcp_session_manager.heal_kernel(
                 session_id=session_id,
                 kernel_manager=kernel_manager,
                 server_client=server_client,
