@@ -109,17 +109,19 @@ class ExecuteCodeTool(BaseTool):
         kernel_manager=None,
         kernel_spec_manager=None,
         notebook_manager=None,
+        session_store=None,
         # Tool-specific parameters
         code: str = None,
         timeout: int = 60,
         kernel_id: str = None,
+        session_id: str = None,
         ensure_kernel_alive_fn=None,
         wait_for_kernel_idle_fn=None,
         safe_extract_outputs_fn=None,
         **kwargs
     ) -> list[Union[str, ImageContent]]:
-        """Execute IPython code directly in the kernel.
-        
+        """Execute IPython code directly in the kernel (ARK-165: session-aware).
+
         Args:
             mode: Server mode (MCP_SERVER or JUPYTER_SERVER)
             server_client: JupyterServerClient (not used)
@@ -127,13 +129,15 @@ class ExecuteCodeTool(BaseTool):
             kernel_manager: Kernel manager (for JUPYTER_SERVER mode)
             kernel_spec_manager: Kernel spec manager (not used)
             notebook_manager: Notebook manager (for MCP_SERVER mode)
+            session_store: SessionStore instance (for session-based operation)
             code: IPython code to execute (supports magic commands, shell commands with !, and Python code)
             timeout: Execution timeout in seconds (default: 60s)
-            kernel_id: Kernel ID (for JUPYTER_SERVER mode)
+            kernel_id: Kernel ID (for JUPYTER_SERVER mode, optional if session_id provided)
+            session_id: Client session ID for multi-client support (ARK-165)
             ensure_kernel_alive_fn: Function to ensure kernel is alive (for MCP_SERVER mode)
             wait_for_kernel_idle_fn: Function to wait for kernel idle state (for MCP_SERVER mode)
             safe_extract_outputs_fn: Function to safely extract outputs
-            
+
         Returns:
             List of outputs from the executed code
         """
@@ -142,11 +146,18 @@ class ExecuteCodeTool(BaseTool):
         
         # JUPYTER_SERVER mode: Use kernel_manager directly
         if mode == ServerMode.JUPYTER_SERVER and kernel_manager is not None:
+            # ARK-165: Get kernel_id from session if not provided
+            if kernel_id is None and session_id and session_store:
+                ctx = session_store.get(session_id)
+                if ctx:
+                    kernel_id = ctx.kernel_id
+                    logger.info(f"Using kernel_id from session '{session_id[:8]}...': {kernel_id}")
+
             if kernel_id is None:
-                # Try to get kernel_id from context
+                # Backward compatibility: try to get kernel_id from context
                 from jupyter_mcp_server.utils import get_current_notebook_context
                 _, kernel_id = get_current_notebook_context(notebook_manager)
-            
+
             if kernel_id is None:
                 # No kernel available - start a new one on demand
                 logger.info("No kernel_id available, starting new kernel for execute_code")

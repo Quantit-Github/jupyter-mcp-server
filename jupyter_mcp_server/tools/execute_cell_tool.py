@@ -9,7 +9,7 @@ import logging
 import time
 import nbformat
 from pathlib import Path
-from typing import Union, List
+from typing import Union, List, Optional
 from mcp.types import ImageContent
 
 from jupyter_mcp_server.tools._base import BaseTool, ServerMode
@@ -94,6 +94,44 @@ class ExecuteCellTool(BaseTool):
 
         logger.info(f"Wrote {len(outputs)} outputs to cell {cell_index} in {notebook_path}")
 
+    def _wrap_structured_output(
+        self,
+        outputs: List[Union[str, ImageContent]],
+        session_id: str = None,
+        notebook_path: str = None,
+        cell_index: int = None
+    ) -> List[Union[str, ImageContent]]:
+        """Wrap raw outputs in structured format for ARK-165 compatibility.
+
+        Args:
+            outputs: Raw execution outputs
+            session_id: Session ID for multi-client support (optional, can be None)
+            notebook_path: Path to the notebook
+            cell_index: Index of the executed cell
+
+        Returns:
+            List with session metadata prepended (if session_id provided), or raw outputs
+        """
+        if session_id is not None:
+            # ARK-165: Prepend session metadata as JSON string
+            import json
+            from datetime import datetime
+
+            session_metadata = json.dumps({
+                "session_id": session_id,
+                "notebook_path": notebook_path,
+                "metadata": {
+                    "cell_index": cell_index,
+                    "output_count": len(outputs),
+                    "timestamp": datetime.now().isoformat()
+                }
+            }, indent=2)
+
+            return [f"📊 Session Info:\n{session_metadata}"] + outputs
+        else:
+            # Backward compatibility: return outputs as-is
+            return outputs
+
     async def execute(
         self,
         mode: ServerMode,
@@ -109,9 +147,14 @@ class ExecuteCellTool(BaseTool):
         stream: bool = False,
         progress_interval: int = 5,
         ensure_kernel_alive_fn=None,
+        session_id: Optional[str] = None,  # ARK-165: Multi-client session support
         **kwargs
     ) -> List[Union[str, ImageContent]]:
-        """Execute a cell with configurable timeout and optional streaming progress updates.
+        """Execute a cell with session-aware context and configurable timeout (ARK-165).
+
+        This tool executes a cell in the notebook associated with the given session_id.
+        It automatically retrieves the correct notebook and kernel from the SessionStore,
+        ensuring proper isolation in multi-client environments.
 
         Args:
             mode: Server mode (MCP_SERVER or JUPYTER_SERVER)
@@ -119,13 +162,94 @@ class ExecuteCellTool(BaseTool):
             kernel_manager: Kernel manager for JUPYTER_SERVER mode
             notebook_manager: Notebook manager for MCP_SERVER mode
             cell_index: Index of the cell to execute (0-based)
-            timeout_seconds: Maximum seconds to wait for execution
-            stream: Enable streaming progress updates for long-running cells
-            progress_interval: Seconds between progress updates when stream=True
-            ensure_kernel_alive_fn: Function to ensure kernel is alive (MCP_SERVER)
+                - Negative indices supported (e.g., -1 for last cell)
+                - Must be within notebook range
+            timeout_seconds: Maximum seconds to wait for execution (default: 60)
+                - Execution interrupted if timeout exceeded
+                - Partial outputs returned on timeout
+            stream: Enable streaming progress updates for long-running cells (default: False)
+                - Only available in MCP_SERVER mode
+                - Provides real-time execution monitoring
+            progress_interval: Seconds between progress updates when stream=True (default: 5)
+            ensure_kernel_alive_fn: Function to ensure kernel is alive (MCP_SERVER only)
+            session_id: Client session ID for multi-client support (ARK-165)
+                - Required for multi-client environments
+                - Used to lookup notebook context from SessionStore
+                - If omitted, falls back to config default (single-client mode)
+            **kwargs: Additional parameters
 
         Returns:
-            List of outputs from the executed cell
+            List of execution outputs (str or ImageContent):
+            - If session_id provided: First element is JSON session metadata, followed by outputs
+            - If session_id not provided: Raw outputs list (backward compatible)
+
+            Session metadata format (when session_id provided):
+            ```json
+            {
+                "session_id": "client-uuid",
+                "notebook_path": "/path/to/notebook.ipynb",
+                "metadata": {
+                    "cell_index": 0,
+                    "output_count": 2,
+                    "timestamp": "2025-01-18T04:05:29.647091"
+                }
+            }
+            ```
+
+        Raises:
+            ValueError: If cell_index is out of range or kernel not available
+            TimeoutError: If execution exceeds timeout_seconds
+            RuntimeError: If notebook or kernel cannot be found
+
+        Example:
+            Single client (backward compatible):
+            ```python
+            result = await execute_cell.execute(
+                mode=ServerMode.JUPYTER_SERVER,
+                cell_index=0,
+                kernel_manager=kernel_manager,
+                serverapp=serverapp
+            )
+            # result = ["output1", "output2", ...]
+            print(result)
+            ```
+
+            Multi-client (ARK-165):
+            ```python
+            # Client A executes cell 0 in their notebook
+            result_a = await execute_cell.execute(
+                mode=ServerMode.JUPYTER_SERVER,
+                cell_index=0,
+                session_id="session-A-uuid",
+                kernel_manager=kernel_manager,
+                serverapp=serverapp
+            )
+            # result_a[0] = "📊 Session Info:\n{...json metadata...}"
+            # result_a[1:] = actual outputs
+
+            # Client B executes cell 0 in their notebook (independent)
+            result_b = await execute_cell.execute(
+                mode=ServerMode.JUPYTER_SERVER,
+                cell_index=0,
+                session_id="session-B-uuid",
+                kernel_manager=kernel_manager,
+                serverapp=serverapp
+            )
+
+            # Verify isolation by checking first element (session metadata)
+            import json
+            metadata_a = json.loads(result_a[0].split("📊 Session Info:\n")[1])
+            metadata_b = json.loads(result_b[0].split("📊 Session Info:\n")[1])
+            assert metadata_a["session_id"] == "session-A-uuid"
+            assert metadata_b["session_id"] == "session-B-uuid"
+            assert metadata_a["notebook_path"] != metadata_b["notebook_path"]
+            ```
+
+        Notes:
+            - ARK-165: Session-based context lookup from SessionStore
+            - Outputs automatically written to notebook file
+            - Supports both RTC (YDoc) and file-based execution
+            - Streaming mode only available in MCP_SERVER mode
         """
         if mode == ServerMode.JUPYTER_SERVER:
             # JUPYTER_SERVER mode: Use ExecutionStack with YDoc awareness
@@ -139,8 +263,17 @@ class ExecuteCellTool(BaseTool):
             if kernel_manager is None:
                 raise ValueError("kernel_manager is required for JUPYTER_SERVER mode")
 
-            # Get notebook_path and kernel_id first
-            notebook_path, kernel_id = get_current_notebook_context(notebook_manager)
+            # ARK-165: Session-based context lookup with auto-healing (Task 4)
+            from jupyter_mcp_server.utils import get_notebook_context_from_session_async
+            notebook_path, kernel_id = await get_notebook_context_from_session_async(
+                session_id=session_id,
+                auto_heal=True,
+                kernel_manager=kernel_manager,
+                mode=mode  # Use mode parameter (ServerMode already imported at top)
+            )
+
+            # Store original path for structured output (ARK-165)
+            original_notebook_path = notebook_path
 
             # Resolve to absolute path
             if notebook_path and serverapp and not Path(notebook_path).is_absolute():
@@ -212,7 +345,13 @@ class ExecuteCellTool(BaseTool):
                     timeout=timeout_seconds
                 )
 
-                return outputs
+                # ARK-165: Always return structured output in JUPYTER_SERVER mode
+                return self._wrap_structured_output(
+                    outputs=outputs,
+                    session_id=session_id,
+                    notebook_path=original_notebook_path,
+                    cell_index=cell_index
+                )
             else:
                 # Notebook not open - use file-based approach
                 logger.info(f"Notebook {file_id} not open, using file mode")
@@ -243,7 +382,13 @@ class ExecuteCellTool(BaseTool):
                 # Write outputs back to file
                 await self._write_outputs_to_cell(notebook_path, cell_index, outputs)
 
-                return outputs
+                # ARK-165: Always return structured output in JUPYTER_SERVER mode
+                return self._wrap_structured_output(
+                    outputs=outputs,
+                    session_id=session_id,
+                    notebook_path=original_notebook_path,
+                    cell_index=cell_index
+                )
 
         elif mode == ServerMode.MCP_SERVER:
             kernel = ensure_kernel_alive_fn()

@@ -5,13 +5,14 @@
 """Overwrite cell source tool implementation."""
 
 import difflib
+import json
 import nbformat
 from pathlib import Path
 from typing import Any, Optional
 from jupyter_server_client import JupyterServerClient
 from jupyter_mcp_server.tools._base import BaseTool, ServerMode
 from jupyter_mcp_server.notebook_manager import NotebookManager
-from jupyter_mcp_server.utils import get_current_notebook_context, get_notebook_model, clean_notebook_outputs
+from jupyter_mcp_server.utils import get_notebook_model, clean_notebook_outputs
 
 
 class OverwriteCellSourceTool(BaseTool):
@@ -162,54 +163,129 @@ class OverwriteCellSourceTool(BaseTool):
         # Tool-specific parameters
         cell_index: int = None,
         cell_source: str = None,
+        session_id: Optional[str] = None,  # ARK-165: Multi-client session support
         **kwargs
-    ) -> str:
-        """Execute the overwrite_cell_source tool.
-        
-        This tool supports three modes of operation:
-        
-        1. JUPYTER_SERVER mode with YDoc (collaborative):
-           - Checks if notebook is open in a collaborative session
-           - Uses YDoc for real-time collaborative editing
-           - Changes are immediately visible to all connected users
-           - Operations protected by thread locks and YDoc transactions
-           
-        2. JUPYTER_SERVER mode without YDoc (file-based):
-           - Falls back to direct file operations using nbformat
-           - Suitable when notebook is not actively being edited
-           
-        3. MCP_SERVER mode (WebSocket):
-           - Uses WebSocket connection to remote Jupyter server
-           - Delegates to remote notebook's set_cell_source method
-        
-        Thread Safety:
-        - YDoc mode: Protected by thread lock + YDoc transaction (atomic)
-        - File mode: No synchronization needed (single-threaded file I/O)
-        - WebSocket mode: Remote server handles synchronization
-        
+    ) -> dict:
+        """Overwrite cell source with session-aware context (ARK-165).
+
+        This tool overwrites the source code of a cell in the notebook associated with
+        the given session_id. It automatically retrieves the correct notebook from the
+        SessionStore and supports multiple execution modes with diff generation.
+
+        Operation Modes:
+            1. JUPYTER_SERVER with YDoc (collaborative):
+               - Uses YDoc for real-time collaborative editing
+               - Changes visible immediately to all connected users
+               - Protected by thread locks and YDoc transactions (atomic)
+
+            2. JUPYTER_SERVER without YDoc (file-based):
+               - Falls back to nbformat file operations
+               - Suitable when notebook is not actively edited
+
+            3. MCP_SERVER (WebSocket):
+               - Uses WebSocket connection to remote server
+               - Remote server handles synchronization
+
         Args:
             mode: Server mode (MCP_SERVER or JUPYTER_SERVER)
             server_client: HTTP client for MCP_SERVER mode
             contents_manager: Direct API access for JUPYTER_SERVER mode
             notebook_manager: Notebook manager instance
             cell_index: Index of the cell to overwrite (0-based)
-            cell_source: New cell source
+                - Must be within notebook range
+                - Both code and markdown cells supported
+            cell_source: New cell source content
+                - Replaces entire cell source
+                - Preserves cell type and metadata
+            session_id: Client session ID for multi-client support (ARK-165)
+                - Required for multi-client environments
+                - Used to lookup notebook context from SessionStore
+                - If omitted, falls back to config default
             **kwargs: Additional parameters
-            
+
         Returns:
-            Success message with diff
-            
+            Structured dict with overwrite results (if session_id provided):
+            ```python
+            {
+                "result": str,  // Success message with unified diff
+                "session_id": str | None,  // Client session ID
+                "notebook_path": str,  // Path to modified notebook
+                "metadata": {
+                    "cell_index": int,     // Index of overwritten cell
+                    "diff": str,           // Unified diff output
+                    "timestamp": str       // ISO 8601 format
+                }
+            }
+            ```
+            Or simple string (backward compatible, if no session_id)
+
         Raises:
-            ValueError: When mode is invalid or required clients are missing
-            ValueError: When cell_index is out of range
+            ValueError: If mode invalid or cell_index out of range
+            FileNotFoundError: If notebook file doesn't exist
+            RuntimeError: If overwrite operation fails
+
+        Example:
+            Single client (backward compatible):
+            ```python
+            result = await overwrite_cell.execute(
+                mode=ServerMode.JUPYTER_SERVER,
+                cell_index=0,
+                cell_source="print('Updated code')",
+                contents_manager=contents_manager,
+                notebook_manager=notebook_manager
+            )
+            ```
+
+            Multi-client (ARK-165):
+            ```python
+            # Client A overwrites cell in their notebook
+            result_a = await overwrite_cell.execute(
+                mode=ServerMode.JUPYTER_SERVER,
+                cell_index=0,
+                cell_source="# Updated markdown",
+                session_id="session-A-uuid",
+                contents_manager=contents_manager,
+                notebook_manager=notebook_manager
+            )
+
+            # Client B overwrites cell in their notebook (independent)
+            result_b = await overwrite_cell.execute(
+                mode=ServerMode.JUPYTER_SERVER,
+                cell_index=0,
+                cell_source="result = 42",
+                session_id="session-B-uuid",
+                contents_manager=contents_manager,
+                notebook_manager=notebook_manager
+            )
+
+            # Verify changes are isolated
+            assert result_a["session_id"] == "session-A-uuid"
+            assert result_b["session_id"] == "session-B-uuid"
+            assert "Updated markdown" in result_a["metadata"]["diff"]
+            assert "result = 42" in result_b["metadata"]["diff"]
+            ```
+
+        Notes:
+            - ARK-165: Session-based context lookup from SessionStore
+            - Generates unified diff showing exact changes made
+            - Thread-safe operations with YDoc transactions
+            - Automatic fallback to file mode if YDoc unavailable
+            - Preserves cell metadata and outputs
         """
         if mode == ServerMode.JUPYTER_SERVER and contents_manager is not None:
             # JUPYTER_SERVER mode: Try YDoc first, fall back to file operations
             from jupyter_mcp_server.jupyter_extension.context import get_server_context
-            
+            from jupyter_mcp_server.utils import get_notebook_context_from_session_async
+
             context = get_server_context()
             serverapp = context.serverapp
-            notebook_path, _ = get_current_notebook_context(notebook_manager)
+            # ARK-165: Session-based context lookup with auto-healing (Task 4)
+            notebook_path, _ = await get_notebook_context_from_session_async(
+                session_id=session_id,
+                auto_heal=True,
+                kernel_manager=kernel_manager,
+                mode=mode  # Use mode parameter (ServerMode already imported at top)
+            )
             
             # Resolve to absolute path
             if serverapp and not Path(notebook_path).is_absolute():
@@ -230,6 +306,23 @@ class OverwriteCellSourceTool(BaseTool):
             raise ValueError(f"Invalid mode or missing required clients: mode={mode}")
         
         if not diff.strip() or diff == "no changes detected":
-            return f"Cell {cell_index} overwritten successfully - no changes detected"
+            result_str = f"Cell {cell_index} overwritten successfully - no changes detected"
         else:
-            return f"Cell {cell_index} overwritten successfully!\n\n```diff\n{diff}\n```"
+            result_str = f"Cell {cell_index} overwritten successfully!\n\n```diff\n{diff}\n```"
+
+        # ARK-165: Structured output with session_id (backward compatible)
+        if session_id is not None:
+            from datetime import datetime
+            return json.dumps({
+                "result": result_str,
+                "session_id": session_id,
+                "notebook_path": notebook_path,
+                "metadata": {
+                    "cell_index": cell_index,
+                    "diff": diff,
+                    "timestamp": datetime.now().isoformat()
+                }
+            }, indent=2)
+        else:
+            # Backward compatibility: return string only
+            return result_str

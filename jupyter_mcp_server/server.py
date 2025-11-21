@@ -20,7 +20,7 @@ from starlette.responses import JSONResponse
 from jupyter_mcp_server.log import logger
 from jupyter_mcp_server.models import DocumentRuntime
 from jupyter_mcp_server.utils import (
-    safe_extract_outputs, 
+    safe_extract_outputs,
     create_kernel,
     start_kernel,
     ensure_kernel_alive,
@@ -30,12 +30,13 @@ from jupyter_mcp_server.utils import (
 from jupyter_mcp_server.config import get_config, set_config
 from jupyter_mcp_server.notebook_manager import NotebookManager
 from jupyter_mcp_server.server_context import ServerContext
+from jupyter_mcp_server.session_store import SessionStore
 from jupyter_mcp_server.enroll import auto_enroll_document
 from jupyter_mcp_server.tools import (
     # Tool infrastructure
     ServerMode,
     # Notebook Management
-    ListNotebooksTool,
+    ListSessionsTool,
     UseNotebookTool,
     RestartNotebookTool,
     UnuseNotebookTool,
@@ -81,6 +82,10 @@ class FastMCPWithCORS(FastMCP):
 mcp = FastMCPWithCORS(name="Jupyter MCP Server", json_response=False, stateless_http=True)
 notebook_manager = NotebookManager()
 server_context = ServerContext.get_instance()
+
+# ARK-165: Session Store for multi-client support
+# Lightweight session storage (1000 sessions ≈ 234 KB)
+session_store = SessionStore(ttl_hours=24)
 
 def __start_kernel():
     """Start the Jupyter kernel with error handling (for backward compatibility)."""
@@ -227,22 +232,22 @@ async def list_files(
     )
 
 
-@mcp.tool()
-async def list_kernels() -> Annotated[str, Field(description="Tab-separated table with columns: ID, Name, Display_Name, Language, State, Connections, Last_Activity, Environment")]:
-    """List all available kernels in the Jupyter server.
+# @mcp.tool()
+# async def list_kernels() -> Annotated[str, Field(description="Tab-separated table with columns: ID, Name, Display_Name, Language, State, Connections, Last_Activity, Environment")]:
+#     """List all available kernels in the Jupyter server.
     
-    This tool shows all running and available kernel sessions on the Jupyter server,
-    including their IDs, names, states, connection information, and kernel specifications.
-    Useful for monitoring kernel resources and identifying specific kernels for connection.
-    """
-    return await safe_notebook_operation(
-        lambda: ListKernelsTool().execute(
-            mode=server_context.mode,
-            server_client=server_context.server_client,
-            kernel_manager=server_context.kernel_manager,
-            kernel_spec_manager=server_context.kernel_spec_manager,
-        )
-    )
+#     This tool shows all running and available kernel sessions on the Jupyter server,
+#     including their IDs, names, states, connection information, and kernel specifications.
+#     Useful for monitoring kernel resources and identifying specific kernels for connection.
+#     """
+#     return await safe_notebook_operation(
+#         lambda: ListKernelsTool().execute(
+#             mode=server_context.mode,
+#             server_client=server_context.server_client,
+#             kernel_manager=server_context.kernel_manager,
+#             kernel_spec_manager=server_context.kernel_spec_manager,
+#         )
+#     )
 
 ###############################################################################
 # Multi-Notebook Management Tools.
@@ -252,13 +257,15 @@ async def list_kernels() -> Annotated[str, Field(description="Tab-separated tabl
 async def use_notebook(
     notebook_name: Annotated[str, Field(description="Unique identifier for the notebook")],
     notebook_path: Annotated[str, Field(description="Path to the notebook file, relative to the Jupyter server root (e.g. 'notebook.ipynb')")],
+    session_id: Annotated[str, Field(description="Client session ID for multi-client support (UUID format recommended)")],
     mode: Annotated[Literal["connect", "create"], Field(description="Notebook operation mode: 'connect' to connect to existing and activate it, 'create' to create new and activate it")] = "connect",
-    kernel_id: Annotated[str, Field(description="Specific kernel ID to use (will create new if skipped)")] = None,
 ) -> Annotated[str, Field(description="Success message with notebook information")]:
     """Use a notebook and activate it for following cell operations.
     All cell operations will be performed on the currently activated notebook.
     Activate new notebook will deactivate the previously activated notebook.
     Reactivate previously activated notebook using same notebook_name and notebook_path.
+
+    Note: Kernel ID is automatically managed via SessionStore - no need to specify it.
     """
     config = get_config()
     return await safe_notebook_operation(
@@ -268,7 +275,6 @@ async def use_notebook(
             notebook_name=notebook_name,
             notebook_path=notebook_path,
             use_mode=mode,
-            kernel_id=kernel_id,
             ensure_kernel_alive_fn=__ensure_kernel_alive,
             contents_manager=server_context.contents_manager,
             kernel_manager=server_context.kernel_manager,
@@ -276,41 +282,54 @@ async def use_notebook(
             notebook_manager=notebook_manager,
             runtime_url=config.runtime_url if config.runtime_url != "local" else None,
             runtime_token=config.runtime_token,
+            session_id=session_id,
         )
     )
 
 
 @mcp.tool()
-async def list_notebooks() -> Annotated[str, Field(description="TSV formatted table with notebook information")]:
-    """List all notebooks that have been used via use_notebook tool"""
-    return await ListNotebooksTool().execute(
+async def list_sessions() -> Annotated[str, Field(description="TSV formatted table with active session information")]:
+    """List all active sessions with their notebook and kernel information.
+
+    Each session represents a client's isolated notebook context (session : notebook : kernel = 1:1:1).
+    Shows session_id, notebook name, notebook path, kernel_id, and last accessed time.
+    """
+    return await ListSessionsTool().execute(
         mode=server_context.mode,
-        notebook_manager=notebook_manager,
+        session_store=session_store,
     )
 
 
 @mcp.tool()
 async def restart_notebook(
-    notebook_name: Annotated[str, Field(description="Notebook identifier to restart")],
+    session_id: Annotated[str, Field(description="Client session ID for multi-client support (UUID format recommended)")],
 ) -> Annotated[str, Field(description="Success message")]:
-    """Restart the kernel for a specific notebook."""
+    """Restart the kernel for a specific session.
+
+    Restarts the kernel associated with the given session, clearing all memory state
+    and imported packages. The session's notebook context (path, name) remains unchanged.
+    """
     return await RestartNotebookTool().execute(
         mode=server_context.mode,
-        notebook_name=notebook_name,
-        notebook_manager=notebook_manager,
+        session_id=session_id,
+        session_store=session_store,
         kernel_manager=server_context.kernel_manager,
     )
 
 
 @mcp.tool()
 async def unuse_notebook(
-    notebook_name: Annotated[str, Field(description="Notebook identifier to disconnect")],
+    session_id: Annotated[str, Field(description="Client session ID for multi-client support (UUID format recommended)")],
 ) -> Annotated[str, Field(description="Success message")]:
-    """Unuse from a specific notebook and release its resources."""
+    """Unuse from a specific session and release its resources.
+
+    Shuts down the kernel associated with the given session and releases all resources.
+    The session will be removed from the active sessions list.
+    """
     return await UnuseNotebookTool().execute(
         mode=server_context.mode,
-        notebook_name=notebook_name,
-        notebook_manager=notebook_manager,
+        session_id=session_id,
+        session_store=session_store,
         kernel_manager=server_context.kernel_manager,
     )
 
@@ -350,6 +369,7 @@ async def insert_cell(
     cell_index: Annotated[int, Field(description="Target index for insertion (0-based), use -1 to append at end", ge=-1)],
     cell_type: Annotated[Literal["code", "markdown"], Field(description="Type of cell to insert")],
     cell_source: Annotated[str, Field(description="Source content for the cell")],
+    session_id: Annotated[str, Field(description="Client session ID for multi-client support (UUID format recommended)")],
 ) -> Annotated[str, Field(description="Success message and the structure of its surrounding cells")]:
     """Insert a cell to specified position from the currently activated notebook."""
     return await safe_notebook_operation(
@@ -362,6 +382,7 @@ async def insert_cell(
             cell_index=cell_index,
             cell_source=cell_source,
             cell_type=cell_type,
+            session_id=session_id,
         )
     )
 
@@ -369,6 +390,7 @@ async def insert_cell(
 async def overwrite_cell_source(
     cell_index: Annotated[int, Field(description="Index of the cell to overwrite (0-based)", ge=0)],
     cell_source: Annotated[str, Field(description="New complete cell source")],
+    session_id: Annotated[str, Field(description="Client session ID for multi-client support (UUID format recommended)")],
 ) -> Annotated[str, Field(description="Success message with diff showing changes made")]:
     """Overwrite the source of a specific cell from the currently activated notebook.
     It will return a diff style comparison (e.g. `+` for new lines, `-` for deleted lines) of the cell's content"""
@@ -381,12 +403,14 @@ async def overwrite_cell_source(
             notebook_manager=notebook_manager,
             cell_index=cell_index,
             cell_source=cell_source,
+            session_id=session_id,
         )
     )
 
 @mcp.tool()
 async def execute_cell(
     cell_index: Annotated[int, Field(description="Index of the cell to execute (0-based)", ge=0)],
+    session_id: Annotated[str, Field(description="Client session ID for multi-client support (UUID format recommended)")],
     timeout: Annotated[int, Field(description="Maximum seconds to wait for execution")] = 90,
     stream: Annotated[bool, Field(description="Enable streaming progress (including time indicator) updates for long-running cells")] = False,
     progress_interval: Annotated[int, Field(description="Seconds between progress updates when stream=True")] = 5,
@@ -403,7 +427,8 @@ async def execute_cell(
             timeout_seconds=timeout,
             stream=stream,
             progress_interval=progress_interval,
-            ensure_kernel_alive_fn=__ensure_kernel_alive
+            ensure_kernel_alive_fn=__ensure_kernel_alive,
+            session_id=session_id,
         ),
         max_retries=1
     )
@@ -412,6 +437,7 @@ async def execute_cell(
 async def insert_execute_code_cell(
     cell_index: Annotated[int, Field(description="Index of the cell to insert and execute (0-based)", ge=0)],
     cell_source: Annotated[str, Field(description="Code source for the cell")],
+    session_id: Annotated[str, Field(description="Client session ID for multi-client support (UUID format recommended)")],
     timeout: Annotated[int, Field(description="Maximum seconds to wait for execution")] = 90,
 ) -> Annotated[list[str | ImageContent], Field(description="List of outputs from the executed cell")]:
     """Insert a cell at specified index from the currently activated notebook and then execute it with timeout and return it's outputs
@@ -423,9 +449,11 @@ async def insert_execute_code_cell(
             contents_manager=server_context.contents_manager,
             kernel_manager=server_context.kernel_manager,
             notebook_manager=notebook_manager,
+            session_store=session_store,
             cell_index=cell_index,
             cell_source=cell_source,
             cell_type="code",
+            session_id=session_id,
         )
     )
 
@@ -440,7 +468,8 @@ async def insert_execute_code_cell(
             timeout_seconds=timeout,
             stream=False,
             progress_interval=0,
-            ensure_kernel_alive_fn=__ensure_kernel_alive
+            ensure_kernel_alive_fn=__ensure_kernel_alive,
+            session_id=session_id,
         ),
         max_retries=1
     )
@@ -448,6 +477,7 @@ async def insert_execute_code_cell(
 @mcp.tool()
 async def read_cell(
     cell_index: Annotated[int, Field(description="Index of the cell to read (0-based)", ge=0)],
+    session_id: Annotated[str, Field(description="Client session ID for multi-client support (UUID format recommended)")],
     include_outputs: Annotated[bool, Field(description="Include outputs in the response (only for code cells)")] = True,
 ) -> Annotated[list[str | ImageContent], Field(description="Cell information including index, type, source, and outputs (for code cells)")]:
     """Read a specific cell from the currently activated notebook and return it's metadata (index, type, execution count), source and outputs (for code cells)"""
@@ -459,12 +489,14 @@ async def read_cell(
             notebook_manager=notebook_manager,
             cell_index=cell_index,
             include_outputs=include_outputs,
+            session_id=session_id,
         )
     )
 
 @mcp.tool()
 async def delete_cell(
     cell_indices: Annotated[list[int], Field(description="List of cell indices to delete (0-based)",min_items=1)],
+    session_id: Annotated[str, Field(description="Client session ID for multi-client support (UUID format recommended)")],
     include_source: Annotated[bool, Field(description="Whether to include the source of deleted cells")] = True,
 ) -> Annotated[str, Field(description="Success message with list of deleted cells and their source (if include_source=True)")]:
     """Delete specific cells from the currently activated notebook and return the cell source of deleted cells (if include_source=True)."""
@@ -477,6 +509,7 @@ async def delete_cell(
             notebook_manager=notebook_manager,
             cell_indices=cell_indices,
             include_source=include_source,
+            session_id=session_id,
         )
     )
 
@@ -484,6 +517,7 @@ async def delete_cell(
 @mcp.tool()
 async def execute_code(
     code: Annotated[str, Field(description="Code to execute (supports magic commands with %, shell commands with !)")],
+    session_id: Annotated[str, Field(description="Client session ID for multi-client support (UUID format recommended)")],
     timeout: Annotated[int, Field(description="Execution timeout in seconds",le=60)] = 30,
 ) -> Annotated[list[str | ImageContent], Field(description="List of outputs from the executed code")]:
     """Execute code directly in the kernel (not saved to notebook) on the current activated notebook.
@@ -499,24 +533,30 @@ async def execute_code(
     1. Import new modules or perform variable assignments that affect subsequent Notebook execution
     2. Execute dangerous code that may harm the Jupyter server or the user's data without permission
     """
-    # Get kernel_id for JUPYTER_SERVER mode
-    # Let the tool handle getting kernel_id via get_current_notebook_context()
+    # ARK-165: Get kernel_id from session_id if provided
     kernel_id = None
     if server_context.mode == ServerMode.JUPYTER_SERVER:
-        current_notebook = notebook_manager.get_current_notebook() or "default"
-        kernel_id = notebook_manager.get_kernel_id(current_notebook)
-        # Note: kernel_id might be None here if notebook not in manager,
-        # but the tool will fall back to config values via get_current_notebook_context()
-    
+        if session_id and session_store:
+            # Use SessionStore to get kernel_id
+            ctx = session_store.get(session_id)
+            if ctx:
+                kernel_id = ctx.kernel_id
+        else:
+            # Backward compatibility: use notebook_manager
+            current_notebook = notebook_manager.get_current_notebook() or "default"
+            kernel_id = notebook_manager.get_kernel_id(current_notebook)
+
     return await safe_notebook_operation(
         lambda: ExecuteCodeTool().execute(
             mode=server_context.mode,
             server_client=server_context.server_client,
             kernel_manager=server_context.kernel_manager,
             notebook_manager=notebook_manager,
+            session_store=session_store,
             code=code,
             timeout=timeout,
             kernel_id=kernel_id,
+            session_id=session_id,
             ensure_kernel_alive_fn=__ensure_kernel_alive,
             wait_for_kernel_idle_fn=wait_for_kernel_idle,
             safe_extract_outputs_fn=safe_extract_outputs,
