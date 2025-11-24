@@ -151,7 +151,7 @@ class ExecuteCodeTool(BaseTool):
                 ctx = session_store.get(session_id)
                 if ctx:
                     kernel_id = ctx.kernel_id
-                    logger.info(f"Using kernel_id from session '{session_id[:8]}...': {kernel_id}")
+                    logger.info(f"Using kernel_id from session '{session_id}': {kernel_id}")
 
             if kernel_id is None:
                 # Backward compatibility: try to get kernel_id from context

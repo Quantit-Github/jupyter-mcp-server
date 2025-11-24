@@ -50,10 +50,10 @@ class RestartNotebookTool(BaseTool):
         if session_id and session_store:
             ctx = session_store.get(session_id)
             if not ctx:
-                return f"Session '{session_id[:8]}...' not found. Use list_sessions to see active sessions."
+                return f"Session '{session_id}' not found. Use list_sessions to see active sessions."
 
             if not ctx.kernel_id:
-                return f"Session '{session_id[:8]}...' has no active kernel."
+                return f"Session '{session_id}' has no active kernel."
 
             kernel_id = ctx.kernel_id
             notebook_name = ctx.current_notebook or "Unknown"

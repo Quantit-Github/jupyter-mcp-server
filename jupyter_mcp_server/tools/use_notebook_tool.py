@@ -338,7 +338,7 @@ class UseNotebookTool(BaseTool):
         # Result: No need to recreate/reconnect, just return success
         if ctx and ctx.notebook_path == notebook_path and kernel_healthy:
             # Kernel is valid, safe to early return
-            logger.info(f"✓ [ARK-165] Session '{session_id[:8]}...' already using '{notebook_path}' with valid kernel")
+            logger.info(f"✓ [ARK-165] Session '{session_id}' already using '{notebook_path}' with valid kernel")
             structured_output = {
                 "result": {
                     "status": "success",
@@ -359,7 +359,7 @@ class UseNotebookTool(BaseTool):
             return json.dumps(structured_output, ensure_ascii=False)
         elif ctx and ctx.notebook_path == notebook_path and not kernel_healthy:
             # Kernel is invalid, continue to recovery logic
-            logger.warning(f"⚠ [ARK-165] Session '{session_id[:8]}...' has invalid kernel '{ctx.kernel_id}', will recover")
+            logger.warning(f"⚠ [ARK-165] Session '{session_id}' has invalid kernel '{ctx.kernel_id}', will recover")
 
         # ARK-165: Prevent multiple sessions from using the same notebook file
         # Scenario: A session using a.ipynb → B session tries to use a.ipynb
@@ -369,7 +369,7 @@ class UseNotebookTool(BaseTool):
             if other_session_id != session_id and ctx.notebook_path == notebook_path:
                 error_msg = (
                     f"Notebook '{notebook_path}' is already in use by another session "
-                    f"(session: {other_session_id[:8]}...). "
+                    f"(session: {other_session_id}). "
                     f"Multiple sessions cannot use the same notebook file simultaneously to prevent conflicts."
                 )
                 logger.warning(f"✗ [ARK-165] {error_msg}")
@@ -380,7 +380,7 @@ class UseNotebookTool(BaseTool):
                         "action": "rejected",
                         "session_id": session_id,
                         "notebook_path": notebook_path,
-                        "conflicting_session": other_session_id[:8] + "...",
+                        "conflicting_session": other_session_id,
                     },
                     "metadata": {
                         "mode": mode.value if mode else None,
@@ -396,7 +396,7 @@ class UseNotebookTool(BaseTool):
         if kernel_id is None and ctx:
             kernel_id = ctx.kernel_id
             if kernel_id:
-                logger.info(f"✓ [ARK-165] Reusing kernel '{kernel_id}' from session '{session_id[:8]}...'")
+                logger.info(f"✓ [ARK-165] Reusing kernel '{kernel_id}' from session '{session_id}'")
 
         # Check the path exists
         if mode == ServerMode.JUPYTER_SERVER and contents_manager is not None:
@@ -415,7 +415,7 @@ class UseNotebookTool(BaseTool):
         # kernel_id가 있지만 커널이 unhealthy이고 session이 존재하면 SessionManager로 자동 복구
         if kernel_id and not kernel_healthy and ctx:
             logger.warning(
-                f"Kernel '{kernel_id}' not found in session '{session_id[:8]}...'. "
+                f"Kernel '{kernel_id}' not found in session '{session_id}'. "
                 f"Attempting auto-recovery with SessionManager."
             )
             new_kernel_id = await mcp_session_manager.heal_kernel(
@@ -434,7 +434,7 @@ class UseNotebookTool(BaseTool):
                 )
             else:
                 # 힐링 실패 - 새 커널 생성으로 fallback
-                logger.warning(f"Kernel healing failed for session '{session_id[:8]}...', will create new kernel")
+                logger.warning(f"Kernel healing failed for session '{session_id}', will create new kernel")
                 kernel_id = None  # 새 커널 생성하도록 None으로 설정
 
         # Create/connect to kernel based on mode
@@ -450,7 +450,7 @@ class UseNotebookTool(BaseTool):
                 info_list.append(f"[INFO] Connected to kernel '{kernel.id}'.")
             except Exception as e:
                 # Kernel creation/connection failed - return clear error message
-                logger.error(f"Failed to create/connect kernel for session '{session_id[:8]}...': {e}")
+                logger.error(f"Failed to create/connect kernel for session '{session_id}': {e}")
                 return f"Failed to connect to kernel: {e}"
         elif mode == ServerMode.JUPYTER_SERVER and kernel_manager is not None:
             # JUPYTER_SERVER mode: Use local kernel manager API directly

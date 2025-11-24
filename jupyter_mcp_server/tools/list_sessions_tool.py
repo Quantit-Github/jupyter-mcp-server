@@ -4,10 +4,10 @@
 
 """List sessions tool implementation."""
 
+import json
 from typing import Any, Optional
 from jupyter_mcp_server.tools._base import BaseTool, ServerMode
 from jupyter_mcp_server.session_store import SessionStore
-from jupyter_mcp_server.utils import format_TSV
 
 
 class ListSessionsTool(BaseTool):
@@ -34,20 +34,22 @@ class ListSessionsTool(BaseTool):
             **kwargs: Additional parameters (unused)
 
         Returns:
-            TSV formatted table with session information
+            JSON formatted list with session information
         """
         if session_store is None:
-            return "No session store available."
+            return json.dumps({
+                "sessions": [],
+                "message": "No session store available."
+            }, ensure_ascii=False)
 
         # Get all active sessions
         all_sessions = session_store.list_all()
 
         if not all_sessions:
-            return "No active sessions. Use the use_notebook tool with a session_id to create a session."
-
-        # Create TSV formatted output
-        headers = ["Session_ID", "Notebook_Name", "Notebook_Path", "Kernel_ID", "Last_Accessed"]
-        rows = []
+            return json.dumps({
+                "sessions": [],
+                "message": "No active sessions. Use the use_notebook tool with a session_id to create a session."
+            }, ensure_ascii=False)
 
         # Sort by last_accessed (most recent first)
         sorted_sessions = sorted(
@@ -56,16 +58,17 @@ class ListSessionsTool(BaseTool):
             reverse=True
         )
 
+        # Build JSON response
+        sessions = []
         for session_id, ctx in sorted_sessions:
-            # Truncate session_id for readability (show first 8 chars)
-            short_session_id = session_id[:8] + "..." if len(session_id) > 8 else session_id
+            sessions.append({
+                "session_id": session_id,
+                "notebook_name": ctx.current_notebook,
+                "notebook_path": ctx.notebook_path,
+                "kernel_id": ctx.kernel_id,
+                "last_accessed": ctx.last_accessed.isoformat() if ctx.last_accessed else None
+            })
 
-            rows.append([
-                short_session_id,
-                ctx.current_notebook or "-",
-                ctx.notebook_path or "-",
-                ctx.kernel_id or "-",
-                ctx.last_accessed.strftime("%Y-%m-%d %H:%M:%S") if ctx.last_accessed else "-"
-            ])
-
-        return format_TSV(headers, rows)
+        return json.dumps({
+            "sessions": sessions
+        }, ensure_ascii=False)
