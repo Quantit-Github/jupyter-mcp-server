@@ -57,11 +57,8 @@ class ListSessionsTool(BaseTool):
         )
 
         for session_id, ctx in sorted_sessions:
-            # Truncate session_id for readability (show first 8 chars)
-            short_session_id = session_id[:8] + "..." if len(session_id) > 8 else session_id
-
             rows.append([
-                short_session_id,
+                session_id,
                 ctx.current_notebook or "-",
                 ctx.notebook_path or "-",
                 ctx.kernel_id or "-",

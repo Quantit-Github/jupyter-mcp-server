@@ -338,7 +338,7 @@ class UseNotebookTool(BaseTool):
         # Result: No need to recreate/reconnect, just return success
         if ctx and ctx.notebook_path == notebook_path and kernel_healthy:
             # Kernel is valid, safe to early return
-            logger.info(f"✓ [ARK-165] Session '{session_id[:8]}...' already using '{notebook_path}' with valid kernel")
+            logger.info(f"✓ [ARK-165] Session '{session_id}' already using '{notebook_path}' with valid kernel")
             structured_output = {
                 "result": {
                     "status": "success",
