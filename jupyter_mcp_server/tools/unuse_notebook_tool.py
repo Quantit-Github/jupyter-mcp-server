@@ -50,7 +50,7 @@ class UnuseNotebookTool(BaseTool):
         if session_id and session_store:
             ctx = session_store.get(session_id)
             if not ctx:
-                return f"Session '{session_id[:8]}...' not found. Use list_sessions to see active sessions."
+                return f"Session '{session_id}' not found. Use list_sessions to see active sessions."
 
             notebook_name = ctx.current_notebook or "Unknown"
             kernel_id = ctx.kernel_id
@@ -59,7 +59,7 @@ class UnuseNotebookTool(BaseTool):
             kernel_shutdown_msg = ""
             if mode == ServerMode.JUPYTER_SERVER and kernel_id and kernel_manager:
                 try:
-                    logger.info(f"Shutting down kernel {kernel_id} for session '{session_id[:8]}...' in JUPYTER_SERVER mode")
+                    logger.info(f"Shutting down kernel {kernel_id} for session '{session_id}' in JUPYTER_SERVER mode")
                     await kernel_manager.shutdown_kernel(kernel_id)
                     logger.info(f"Kernel {kernel_id} shutdown successfully")
                     kernel_shutdown_msg = " Kernel shutdown completed."
@@ -70,11 +70,11 @@ class UnuseNotebookTool(BaseTool):
             # ARK-165: Remove session from SessionStore immediately
             removed = session_store.remove(session_id)
             if removed:
-                logger.info(f"✓ [ARK-165] Session '{session_id[:8]}...' removed from SessionStore")
-                return f"Session '{session_id[:8]}...' (notebook: '{notebook_name}') unused successfully.{kernel_shutdown_msg} Session removed from store."
+                logger.info(f"✓ [ARK-165] Session '{session_id}' removed from SessionStore")
+                return f"Session '{session_id}' (notebook: '{notebook_name}') unused successfully.{kernel_shutdown_msg} Session removed from store."
             else:
-                logger.warning(f"✗ [ARK-165] Session '{session_id[:8]}...' not found in SessionStore (may have already expired)")
-                return f"Session '{session_id[:8]}...' (notebook: '{notebook_name}') unused.{kernel_shutdown_msg} Session was not found in store."
+                logger.warning(f"✗ [ARK-165] Session '{session_id}' not found in SessionStore (may have already expired)")
+                return f"Session '{session_id}' (notebook: '{notebook_name}') unused.{kernel_shutdown_msg} Session was not found in store."
 
         # Backward compatibility: notebook_name based operation
         elif notebook_name and notebook_manager:

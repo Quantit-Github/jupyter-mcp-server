@@ -154,7 +154,7 @@ class SessionManager:
 
         # 2. kernel_id가 없으면 커널 없음으로 판단
         if not ctx.kernel_id:
-            logger.debug(f"Session {session_id[:8]}... has no kernel_id")
+            logger.debug(f"Session {session_id} has no kernel_id")
             return ctx, False
 
         # 3. 실제 커널 존재 여부 확인 (mode별 분기)
@@ -313,7 +313,7 @@ class SessionManager:
                     kernel_id=new_kernel_id
                 )
                 logger.info(
-                    f"✓ Kernel healed for session {session_id[:8]}...: {new_kernel_id}"
+                    f"✓ Kernel healed for session {session_id}: {new_kernel_id}"
                 )
                 return new_kernel_id
             else:

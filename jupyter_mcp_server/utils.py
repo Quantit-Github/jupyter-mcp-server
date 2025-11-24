@@ -246,7 +246,7 @@ async def get_notebook_context_from_session_async(
         if ctx and not kernel_healthy:
             # 커널이 죽었음 - 자동 힐링 시도
             logger.warning(
-                f"Kernel unhealthy for session {session_id[:8]}..., attempting heal"
+                f"Kernel unhealthy for session {session_id}, attempting heal"
             )
             new_kernel_id = await session_manager.heal_kernel(
                 session_id=session_id,
