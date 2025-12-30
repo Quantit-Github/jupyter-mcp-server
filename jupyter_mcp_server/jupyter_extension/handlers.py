@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2024 Datalayer, Inc.
+# Copyright (c) 2024- Datalayer, Inc.
 #
 # BSD 3-Clause License
 
@@ -11,16 +11,16 @@ FastMCP, managing the MCP protocol lifecycle and request proxying.
 
 import json
 import logging
-import tornado.web
 from typing import Any
 from tornado.web import RequestHandler
 from jupyter_server.base.handlers import JupyterHandler
-from jupyter_server.extension.handler import ExtensionHandlerMixin
 
 from jupyter_mcp_server.jupyter_extension.context import get_server_context
 from jupyter_mcp_server.server_context import ServerContext
 from jupyter_mcp_server.jupyter_extension.backends.local_backend import LocalBackend
 from jupyter_mcp_server.jupyter_extension.backends.remote_backend import RemoteBackend
+from jupyter_mcp_server.utils import clean_mcp_response, clean_mcp_response_content
+
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ class MCPSSEHandler(RequestHandler):
                         },
                         "serverInfo": {
                             "name": "Jupyter MCP Server",
-                            "version": "0.14.0"
+                            "version": "0.20.0"
                         }
                     }
                 }
@@ -134,6 +134,7 @@ class MCPSSEHandler(RequestHandler):
                     jupyter_tools_data = []
                     try:
                         from jupyter_mcp_tools import get_tools
+                        from jupyter_mcp_server.tool_cache import get_tool_cache
                         
                         # Get the server's base URL dynamically from ServerApp
                         context = get_server_context()
@@ -164,28 +165,40 @@ class MCPSSEHandler(RequestHandler):
                             
                             logger.info(f"Looking for specific jupyter-mcp-tools: {allowed_jupyter_tools}")
                             
-                            # Try querying with broader terms since specific IDs don't work
+                            # Try querying with caching to avoid expensive repeated calls
                             try:
                                 search_query = ",".join(allowed_jupyter_tools)
                                 logger.info(f"Searching jupyter-mcp-tools with query: '{search_query}' (allowed_tools: {allowed_jupyter_tools})")
                                 
-                                # Query for notebook-related tools with broader search term
-                                jupyter_tools_data = await get_tools(
+                                # Use cached get_tools to avoid expensive repeated calls
+                                tool_cache = get_tool_cache()
+                                
+                                # Create wrapper function that matches the expected signature
+                                async def get_tools_wrapper(**kwargs):
+                                    # Add wait_timeout for handlers.py compatibility
+                                    return await get_tools(
+                                        wait_timeout=5,  # Shorter timeout - if frontend isn't loaded, don't wait long
+                                        **kwargs
+                                    )
+                                
+                                jupyter_tools_data = await tool_cache.get_tools(
                                     base_url=base_url,
                                     token=token,
                                     query=search_query,
-                                    enabled_only=False
+                                    enabled_only=False,
+                                    ttl_seconds=180,  # 3 minutes for handlers (shorter than server.py)
+                                    fetch_func=get_tools_wrapper  # Use wrapper that includes wait_timeout
                                 )
-                                logger.info(f"Query returned {len(jupyter_tools_data)} tools")
+                                logger.info(f"Query returned {len(jupyter_tools_data)} tools (from cache or fresh)")
                                 
                                 # Use the tools directly since query should return only what we want
                                 for tool in jupyter_tools_data:
                                     logger.info(f"Found tool: {tool.get('id', '')}")
                             except Exception as e:
-                                logger.warning(f"Failed to load jupyter-mcp-tools: {e}")
+                                logger.warning(f"Failed to load jupyter-mcp-tools (this is normal if JupyterLab frontend is not loaded): {e}")
                                 jupyter_tools_data = []
                             
-                            logger.info(f"Successfully loaded {len(jupyter_tools_data)} specific jupyter-mcp-tools")
+                            logger.info(f"Successfully loaded {len(jupyter_tools_data)} specific jupyter-mcp-tools (requires JupyterLab frontend)")
                         else:
                             # JupyterLab mode disabled, don't load any jupyter-mcp-tools
                             jupyter_tools_data = []
@@ -343,11 +356,14 @@ class MCPSSEHandler(RequestHandler):
                                 serialized_content = []
                                 for item in content_list:
                                     if hasattr(item, 'model_dump'):
-                                        serialized_content.append(item.model_dump())
+                                        serialized_item = clean_mcp_response_content(item.model_dump())
+                                        serialized_content.append(serialized_item)
                                     elif hasattr(item, 'dict'):
-                                        serialized_content.append(item.dict())
+                                        serialized_item = clean_mcp_response_content(item.dict())
+                                        serialized_content.append(serialized_item)
                                     elif isinstance(item, dict):
-                                        serialized_content.append(item)
+                                        serialized_item = clean_mcp_response_content(item)
+                                        serialized_content.append(serialized_item)
                                     else:
                                         serialized_content.append({"type": "text", "text": str(item)})
                                 result_dict = {"content": serialized_content}
@@ -355,9 +371,9 @@ class MCPSSEHandler(RequestHandler):
                                 result_dict = {"content": [{"type": "text", "text": str(result)}]}
                         # Convert result to dict - it's a CallToolResult with content list
                         elif hasattr(result, 'model_dump'):
-                            result_dict = result.model_dump()
+                            result_dict = clean_mcp_response(result.model_dump())
                         elif hasattr(result, 'dict'):
-                            result_dict = result.dict()
+                            result_dict = clean_mcp_response(result.dict())
                         elif hasattr(result, 'content'):
                             # Extract content directly if it has a content attribute
                             result_dict = {"content": result.content}
@@ -438,7 +454,7 @@ class MCPSSEHandler(RequestHandler):
             self.finish()
 
 
-class MCPHandler(ExtensionHandlerMixin, JupyterHandler):
+class MCPHandler(JupyterHandler):
     """Base handler for MCP endpoints with common functionality."""
     
     def get_backend(self):
@@ -486,7 +502,6 @@ class MCPHealthHandler(MCPHandler):
     GET /mcp/healthz
     """
     
-    @tornado.web.authenticated
     def get(self):
         """Handle health check request."""
         context = get_server_context()
@@ -497,7 +512,7 @@ class MCPHealthHandler(MCPHandler):
             "document_url": context.document_url or self.settings.get("mcp_document_url"),
             "runtime_url": context.runtime_url or self.settings.get("mcp_runtime_url"),
             "extension": "jupyter_mcp_server",
-            "version": "0.14.0"
+            "version": "0.20.0"
         }
         
         self.set_header("Content-Type", "application/json")
@@ -512,7 +527,6 @@ class MCPToolsListHandler(MCPHandler):
     GET /mcp/tools/list
     """
     
-    @tornado.web.authenticated
     async def get(self):
         """Return list of available tools dynamically from the tool registry."""
         # Import here to avoid circular dependency
@@ -539,7 +553,6 @@ class MCPToolsCallHandler(MCPHandler):
     Body: {"tool_name": "...", "arguments": {...}}
     """
     
-    @tornado.web.authenticated
     async def post(self):
         """Handle tool execution request."""
         try:
