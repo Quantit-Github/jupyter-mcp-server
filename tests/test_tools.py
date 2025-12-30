@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2024 Datalayer, Inc.
+# Copyright (c) 2024- Datalayer, Inc.
 #
 # BSD 3-Clause License
 
@@ -105,6 +105,11 @@ async def test_cell_manipulation(mcp_client_parametrized: MCPClient):
         # Test code cell operations
         code_content = "1 + 1"
         code_result = await mcp_client_parametrized.insert_execute_code_cell(1, code_content)
+        expected_result = eval(code_content)
+        assert int(code_result['result'][0]) == expected_result
+
+        # Testing appending code cell to bottom of notebook
+        code_result = await mcp_client_parametrized.insert_execute_code_cell(-1, code_content)
         expected_result = eval(code_content)
         assert int(code_result['result'][0]) == expected_result
 

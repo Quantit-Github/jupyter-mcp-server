@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2024 Datalayer, Inc.
+# Copyright (c) 2024- Datalayer, Inc.
 #
 # BSD 3-Clause License
 
@@ -435,7 +435,7 @@ async def execute_cell(
 
 @mcp.tool()
 async def insert_execute_code_cell(
-    cell_index: Annotated[int, Field(description="Index of the cell to insert and execute (0-based)", ge=0)],
+    cell_index: Annotated[int, Field(description="Index of the cell to insert and execute (0-based)", ge=-1)],
     cell_source: Annotated[str, Field(description="Code source for the cell")],
     session_id: Annotated[str, Field(description="Client session ID for multi-client support (UUID format recommended)")],
     timeout: Annotated[int, Field(description="Maximum seconds to wait for execution")] = 90,
@@ -617,9 +617,10 @@ async def get_registered_tools():
         if server_context.is_jupyterlab_mode():
             logger.info("JupyterLab mode enabled, loading selected jupyter-mcp-tools")
             
-            # Get tools from jupyter-mcp-tools extension
+            # Get tools from jupyter-mcp-tools extension with caching
             try:
                 from jupyter_mcp_tools import get_tools
+                from jupyter_mcp_server.tool_cache import get_tool_cache
                 
                 # Get the base_url and token from server context
                 # In JUPYTER_SERVER mode, we should use the actual serverapp URL, not hardcoded localhost
@@ -642,18 +643,21 @@ async def get_registered_tools():
                     "notebook_run-all-cells",  # Run all cells in current notebook  
                 ]
                 
-                # Try querying with broader terms since specific IDs don't work
+                # Try querying with caching to avoid expensive repeated calls
                 try:
                     search_query = ",".join(allowed_jupyter_tools)
                     logger.info(f"Searching jupyter-mcp-tools with query: '{search_query}' (allowed_tools: {allowed_jupyter_tools})")
                     
-                    tools_data = await get_tools(
+                    # Use cached get_tools to avoid expensive repeated calls
+                    tool_cache = get_tool_cache()
+                    tools_data = await tool_cache.get_tools(
                         base_url=base_url,
                         token=token,
                         query=search_query,
-                        enabled_only=False
+                        enabled_only=False,
+                        fetch_func=get_tools  # Pass the actual get_tools function for cache misses
                     )
-                    logger.info(f"Query returned {len(tools_data)} tools")
+                    logger.info(f"Query returned {len(tools_data)} tools (from cache or fresh)")
                     
                     # Use the tools directly since query should return only what we want
                     for tool in tools_data:
